@@ -1,0 +1,215 @@
+
+##·························································· STEP 0
+## Install Cell Ranger - 7.0.1 (August 18, 2022)
+
+cd /home/daniel/Desktop/WORK/WORK/scRNASeq
+
+curl -o cellranger-7.0.1.tar.gz "https://cf.10xgenomics.com/releases/cell-exp/cellranger-7.0.1.tar.gz?Expires=1666218633&Policy=eyJTdGF0ZW1lbnQiOlt7IlJlc291cmNlIjoiaHR0cHM6Ly9jZi4xMHhnZW5vbWljcy5jb20vcmVsZWFzZXMvY2VsbC1leHAvY2VsbHJhbmdlci03LjAuMS50YXIuZ3oiLCJDb25kaXRpb24iOnsiRGF0ZUxlc3NUaGFuIjp7IkFXUzpFcG9jaFRpbWUiOjE2NjYyMTg2MzN9fX1dfQ__&Signature=HF9dTSpkcU9rYPnGrw7newYsk~dcspzfQeJLIE~MxDGpsCB96OycCijpthIalL3M5C8nj59nANvc-3T2RxCTpLlKiwFSIhN2y0bh8JzDPELcPtR1z5wNSPFcKIPgjN9MV3xbiFzZ-i3n41qH0eP~fc-u9XfJhf~cADeDJFlKAwyhrhz8IdsWxnn7aF-h5E9znibU5lP-LY7XbA6FKNvnIz-pwgRNGunC5GKiVFZNskHFkUYse9vFaM-bEf4X3d9dYcjU7ouodDCH9U5rbaAUtPMYtV6~wi2O~Uk3MeVv9neIXXVK8aDsB-PrXQZsR~FRnEc~6KaszhjUNlqAbC8B9g__&Key-Pair-Id=APKAI7S6A5RYOXBWRPDA"
+
+tar -zxvf cellranger-7.0.1.tar.gz
+
+cd cellranger-7.0.1
+export PATH=~/Desktop/WORK/scRNASeq/cellranger-7.0.1:$PATH
+
+
+##·························································· STEP 1
+## Create reference
+
+cd /home/daniel/Desktop/WORK/WORK/scRNASeq/MouseGranada/refData
+
+# Genome metadata
+genome="mm10"
+version="2020-A"
+
+
+# Set up source and build directories
+build="mm10-2020-A_build"
+mkdir -p "$build"
+
+
+# Download source files if they do not exist in reference_sources/ folder
+source="reference_sources"
+mkdir -p "$source"
+
+
+fasta_url="http://ftp.ensembl.org/pub/release-98/fasta/mus_musculus/dna/Mus_musculus.GRCm38.dna.primary_assembly.fa.gz"
+fasta_in="${source}/Mus_musculus.GRCm38.dna.primary_assembly.fa"
+gtf_url="http://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M23/gencode.vM23.primary_assembly.annotation.gtf.gz"
+gtf_in="${source}/gencode.vM23.primary_assembly.annotation.gtf"
+
+
+if [ ! -f "$fasta_in" ]; then
+    curl -sS "$fasta_url" | zcat > "$fasta_in"
+fi
+if [ ! -f "$gtf_in" ]; then
+    curl -sS "$gtf_url" | zcat > "$gtf_in"
+fi
+
+
+# Modify sequence headers in the Ensembl FASTA to match the file
+# "GRCm38.primary_assembly.genome.fa" from GENCODE. Unplaced and unlocalized
+# sequences such as "GL456210.1" have the same names in both versions.
+#
+# Input FASTA:
+#   >1 dna:chromosome chromosome:GRCm38:1:1:195471971:1 REF
+#
+# Output FASTA:
+#   >chr1 1
+fasta_modified="$build/$(basename "$fasta_in").modified"
+# sed commands:
+# 1. Replace metadata after space with original contig name, as in GENCODE
+# 2. Add "chr" to names of autosomes and sex chromosomes
+# 3. Handle the mitochrondrial chromosome
+cat "$fasta_in" \
+    | sed -E 's/^>(\S+).*/>\1 \1/' \
+    | sed -E 's/^>([0-9]+|[XY]) />chr\1 /' \
+    | sed -E 's/^>MT />chrM /' \
+    > "$fasta_modified"
+
+
+# Remove version suffix from transcript, gene, and exon IDs in order to match
+# previous Cell Ranger reference packages
+#
+# Input GTF:
+#     ... gene_id "ENSMUSG00000102693.1"; ...
+# Output GTF:
+#     ... gene_id "ENSMUSG00000102693"; gene_version "1"; ...
+gtf_modified="$build/$(basename "$gtf_in").modified"
+# Pattern matches Ensembl gene, transcript, and exon IDs for human or mouse:
+ID="(ENS(MUS)?[GTE][0-9]+)\.([0-9]+)"
+cat "$gtf_in" \
+    | sed -E 's/gene_id "'"$ID"'";/gene_id "\1"; gene_version "\3";/' \
+    | sed -E 's/transcript_id "'"$ID"'";/transcript_id "\1"; transcript_version "\3";/' \
+    | sed -E 's/exon_id "'"$ID"'";/exon_id "\1"; exon_version "\3";/' \
+    > "$gtf_modified"
+
+
+# Define string patterns for GTF tags
+# NOTES:
+# - Since GENCODE release 31/M22 (Ensembl 97), the "lincRNA" and "antisense"
+#   biotypes are part of a more generic "lncRNA" biotype.
+# - These filters are relevant only to GTF files from GENCODE. The GTFs from
+#   Ensembl release 98 have the following differences:
+#   - The names "gene_biotype" and "transcript_biotype" are used instead of
+#     "gene_type" and "transcript_type".
+#   - Readthrough transcripts are present but are not marked with the
+#     "readthrough_transcript" tag.
+BIOTYPE_PATTERN=\
+"(protein_coding|lncRNA|\
+IG_C_gene|IG_D_gene|IG_J_gene|IG_LV_gene|IG_V_gene|\
+IG_V_pseudogene|IG_J_pseudogene|IG_C_pseudogene|\
+TR_C_gene|TR_D_gene|TR_J_gene|TR_V_gene|\
+TR_V_pseudogene|TR_J_pseudogene)"
+GENE_PATTERN="gene_type \"${BIOTYPE_PATTERN}\""
+TX_PATTERN="transcript_type \"${BIOTYPE_PATTERN}\""
+READTHROUGH_PATTERN="tag \"readthrough_transcript\""
+
+
+# Construct the gene ID allowlist. We filter the list of all transcripts
+# based on these criteria:
+#   - allowable gene_type (biotype)
+#   - allowable transcript_type (biotype)
+#   - no "readthrough_transcript" tag
+# We then collect the list of gene IDs that have at least one associated
+# transcript passing the filters.
+cat "$gtf_modified" \
+    | awk '$3 == "transcript"' \
+    | grep -E "$GENE_PATTERN" \
+    | grep -E "$TX_PATTERN" \
+    | grep -Ev "$READTHROUGH_PATTERN" \
+    | sed -E 's/.*(gene_id "[^"]+").*/\1/' \
+    | sort \
+    | uniq \
+    > "${build}/gene_allowlist"
+
+
+# Filter the GTF file based on the gene allowlist
+gtf_filtered="${build}/$(basename "$gtf_in").filtered"
+# Copy header lines beginning with "#"
+grep -E "^#" "$gtf_modified" > "$gtf_filtered"
+# Filter to the gene allowlist
+grep -Ff "${build}/gene_allowlist" "$gtf_modified" \
+    >> "$gtf_filtered"
+
+
+# Create reference package
+cellranger mkref --ref-version="$version" \
+    --genome="$genome" --fasta="$fasta_modified" --genes="$gtf_filtered"
+
+
+
+##·························································· STEP 2
+## Alignment (from FASTQ to Counts)
+
+## Example
+cd /home/daniel/Desktop/WORK/scRNASeq/MorellMouse/data
+
+#wget https://cf.10xgenomics.com/samples/cell-exp/3.0.0/pbmc_1k_v3/pbmc_1k_v3_fastqs.tar
+#tar -xvf pbmc_1k_v3_fastqs.tar
+
+## FastQ names format: Sample_S1_L00X_R1_001.fastq.gz
+
+## 9 Sampels
+
+cellranger count --id=WT_1 \
+   --transcriptome=/home/daniel/Desktop/WORK/scRNASeq/MorellMouse/refData/mm10 \
+   --fastqs=/home/daniel/Desktop/DATA/scRNASeq/Morell/FastQ/GENext05_23_1 \
+   --sample=WT-1 \
+   --localcores=10 \
+   --localmem=64
+   
+cellranger count --id=WT_2 \
+   --transcriptome=/home/daniel/Desktop/WORK/scRNASeq/MorellMouse/refData/mm10 \
+   --fastqs=/home/daniel/Desktop/DATA/scRNASeq/Morell/FastQ/GENext05_23_2 \
+   --sample=WT-2 \
+   --localcores=10 \
+   --localmem=64
+
+cellranger count --id=WT_3 \
+   --transcriptome=/home/daniel/Desktop/WORK/scRNASeq/MorellMouse/refData/mm10 \
+   --fastqs=/home/daniel/Desktop/DATA/scRNASeq/Morell/FastQ/GENext05_23_3 \
+   --sample=WT-3 \
+   --localcores=10 \
+   --localmem=64
+
+cellranger count --id=TLR_1 \
+   --transcriptome=/home/daniel/Desktop/WORK/scRNASeq/MorellMouse/refData/mm10 \
+   --fastqs=/home/daniel/Desktop/DATA/scRNASeq/Morell/FastQ/GENext05_23_4 \
+   --sample=TLR7-1 \
+   --localcores=10 \
+   --localmem=64
+
+cellranger count --id=TLR_2 \
+   --transcriptome=/home/daniel/Desktop/WORK/scRNASeq/MorellMouse/refData/mm10 \
+   --fastqs=/home/daniel/Desktop/DATA/scRNASeq/Morell/FastQ/GENext05_23_5 \
+   --sample=TLR7-2 \
+   --localcores=10 \
+   --localmem=64
+
+cellranger count --id=TLR_3 \
+   --transcriptome=/home/daniel/Desktop/WORK/scRNASeq/MorellMouse/refData/mm10 \
+   --fastqs=/home/daniel/Desktop/DATA/scRNASeq/Morell/FastQ/GENext05_23_6 \
+   --sample=TLR7-3 \
+   --localcores=10 \
+   --localmem=64
+
+cellranger count --id=BANK_1 \
+   --transcriptome=/home/daniel/Desktop/WORK/scRNASeq/MorellMouse/refData/mm10 \
+   --fastqs=/home/daniel/Desktop/DATA/scRNASeq/Morell/FastQ/GENext05_23_7 \
+   --sample=KO-1 \
+   --localcores=10 \
+   --localmem=64
+
+cellranger count --id=BANK_2 \
+   --transcriptome=/home/daniel/Desktop/WORK/scRNASeq/MorellMouse/refData/mm10 \
+   --fastqs=/home/daniel/Desktop/DATA/scRNASeq/Morell/FastQ/GENext05_23_8 \
+   --sample=KO-2 \
+   --localcores=10 \
+   --localmem=64
+
+cellranger count --id=BANK_3 \
+   --transcriptome=/home/daniel/Desktop/WORK/scRNASeq/MorellMouse/refData/mm10 \
+   --fastqs=/home/daniel/Desktop/DATA/scRNASeq/Morell/FastQ/GENext05_23_9 \
+   --sample=KO-3 \
+   --localcores=10 \
+   --localmem=64
